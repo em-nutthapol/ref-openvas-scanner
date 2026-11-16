@@ -6,6 +6,7 @@ use std::fs::Permissions;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use scannerlib::SQLITE_LIMIT_VARIABLE_NUMBER;
 use sqlx::Connection;
@@ -19,7 +20,8 @@ use sqlx::{
     sqlite::{SqliteQueryResult, SqliteRow},
 };
 
-use crate::config::{Config, DBLocation};
+use crate::config::{Config, DBLocation, SqliteConfiguration};
+use crate::crypt::{Crypt, Crypter, Encrypted};
 use crate::database::dao::{DAOError, DAOHandler, DBViolation, InfrastructureReason};
 
 pub mod results;
@@ -29,6 +31,7 @@ pub mod state_change;
 pub mod vts;
 
 pub type DataBase = SqlitePool;
+pub type Transaction<'a> = sqlx::Transaction<'a, Sqlite>;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 
@@ -106,6 +109,67 @@ pub async fn create_pool(
         .connect_with(options)
         .await
         .map_err(|e| e.into())
+}
+
+pub struct SqliteDatabase {
+    pool: SqlitePool,
+    crypter: Crypter,
+}
+
+impl SqliteDatabase {
+    pub async fn init(config: &SqliteConfiguration, name: &str) -> anyhow::Result<Arc<Self>> {
+        let pool = create_pool(config, name).await?;
+        let crypter = Crypter::from_config(config, &pool).await?;
+
+        Ok(Arc::new(Self { pool, crypter }))
+    }
+
+    /// Begins an IMMEDIATE transaction
+    pub async fn tx(&self) -> anyhow::Result<Transaction<'_>> {
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| e.into())
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub(super) async fn encrypt<T>(&self, input: &T) -> anyhow::Result<String>
+    where
+        T: serde::Serialize,
+    {
+        let bytes = serde_json::to_vec(input)?;
+        Ok(self.crypter.encrypt(bytes).await?.to_string())
+    }
+
+    pub(super) async fn decrypt<T>(&self, input: &str) -> anyhow::Result<T>
+    where
+        T: for<'de> serde::Deserialize<'de>,
+    {
+        let encrypted = Encrypted::try_from(input)?;
+        let output = self.crypter.decrypt(encrypted).await?;
+        serde_json::from_slice::<T>(&output).map_err(|e| e.into())
+    }
+}
+
+impl Drop for SqliteDatabase {
+    fn drop(&mut self) {
+        let keep_failed_db =
+            std::thread::panicking() && std::env::var("KEEP_TEST_DB").is_ok_and(|x| x == "true");
+
+        if !keep_failed_db && let Some(path) = self.pool.connect_options().get_filename().parent() {
+            let active_connections = self.pool.size().saturating_sub(self.pool.num_idle() as u32);
+            if active_connections > 0 {
+                tracing::debug!(active_connections, "DB connections active at shutdown");
+            }
+
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                tracing::warn!("failed to cleanup database: {e}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
